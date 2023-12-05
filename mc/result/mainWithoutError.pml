@@ -1,47 +1,46 @@
 #define NUM_MODULES 4
-#define FINISH_COUNTER 10 // final speed
+#define FINISH_ANGLE_SPEED 10 // final speed
 #define BUS_SIZE 5
 
 //MESSAGES
 #define ENGINE_MSG 15
-#define BIUS_ZERO_MSG 0
+#define BIUS_ZERO_MSG -1
 #define BIUS_MSG 1
-//COUNTER TO RESET
-#define ZERO_MEASEGES_TO_RESET 4
+#define MODULE_MSG 14
+#define ZERO_MEASEGES_TO_RESET 4 //COUNTER TO RESET
 
-// mtype = { IN_CIRLE_ORBIT, GO_TO_ELLIPTICAL_ORBIT, IN_ELLIPTICAL_ORBIT }; // положение станции
-// mtype = { IN_CIRLE_ORBIT, GO_TO_ELLIPTICAL_ORBIT, GOING_TO_ELLIPTICAL_ORBIT, IN_ELLIPTICAL_ORBIT}; // положение станции
-
-// mtype = { IN_CIRLE_ORBIT, GOING_TO_ELLIPTICAL_ORBIT, IN_ELLIPTICAL_ORBIT}; // положение станции
-mtype = {NON_LANDING, START_LANDING, LANDING, LANDED}
-
+mtype = { IN_CIRLE_ORBIT, GO_TO_ELLIPTICAL_ORBIT, GOING_TO_ELLIPTICAL_ORBIT, IN_ELLIPTICAL_ORBIT}; // положение станции
 mtype = { WORK, NOT_WORK}
-mtype = { BKU, BIUS, ENGINE, MODULE }; // доступные модули
+mtype = { BKU, BIUS, ENGINE, MODULES }; // доступные модули
 
 mtype = { NONE, ENABLE_ACCELEROMETERS, DISABLE_ACCELEROMETERS, START_ENGINE, STOP_ENGINE, RESET }; // команды
 mtype = { SYNC }
 
-mtype STATION_STATUS = NON_LANDING
-
-
+mtype STATION_STATUS = IN_CIRLE_ORBIT
 mtype BIUS_STATE = NOT_WORK
 mtype ENGINE_STATE = NOT_WORK
+mtype MODULES_STATE = NOT_WORK
 
 // 0 - для двигателя, 1 - для биуса.
 chan command_bus[2] = [BUS_SIZE] of { mtype }; // ОТ БКУ К ДВИГАТЕЛЮ(0) И БИУСУ(1)
-chan data_bus = [BUS_SIZE] of { byte } // ОТ ДВИГАТЕЛЮ(0) И БИУСА(1) К БКУ
-
+chan data_bus[3] = [1] of { int } // ОТ ДВИГАТЕЛЮ(0) И БИУСА(1) К БКУ (по идее если биус отсылает скорость аппарата угловую, то надо, чтобы размер был 1, чтобы не копились скорости, а если есть в канале, то текущую считало бы)
+chan stop_reported = [2] of { int }
 
 chan turn = [1] of { mtype };
-
 chan sync = [1] of {mtype}
-chan addSync = [1] of {mtype}
+chan roundSync = [3] of {mtype}
 
-int angleSpeed = 0;
 int cur_zero_msg_counter = 0;
 
-bool delayedEnableAccelerometers = false
+bool enableAccelerometersSended = false
 
+bool biusEnabledSend = false
+bool biusDisabledSend = false
+bool engineDisabledSend = false
+bool resetSend = false
+
+bool isBiusEnabled = false
+bool isEngineEnabled = false
 
 active proctype Enviroment() {
     do
@@ -53,6 +52,13 @@ active proctype Enviroment() {
 
         turn ! ENGINE
         // sync ? ENGINE
+
+        // turn ! MODULES
+        // sync ? MODULES
+
+        roundSync ? SYNC
+        roundSync ? SYNC
+        roundSync ? SYNC
     od
 }
 
@@ -76,66 +82,89 @@ active proctype Enviroment() {
 */
 
 active proctype Bku() {
-    int cur_angle_speed = 0;
     int var = 0;
     do 
     ::  turn ? BKU ->
             if 
-                ::  STATION_STATUS == START_LANDING -> 
+                ::  STATION_STATUS == GO_TO_ELLIPTICAL_ORBIT -> 
+                        biusEnabledSend = true
+                        enableAccelerometersSended = true
+                        STATION_STATUS = GOING_TO_ELLIPTICAL_ORBIT;
+                        cur_zero_msg_counter = 0 // добавил, мб неправильно
+
                         command_bus[1] ! ENABLE_ACCELEROMETERS;
                         command_bus[0] ! START_ENGINE;
-                        delayedEnableAccelerometers = true
-                        STATION_STATUS = LANDING;
-                        // sync ! BKU
-                :: cur_angle_speed == FINISH_COUNTER -> 
-                        command_bus[1] ! DISABLE_ACCELEROMETERS
-                        command_bus[0] ! STOP_ENGINE
-                        // sync ! BKU
 
-                :: nempty(data_bus) ->
-                    data_bus ? var
+                        //clear from zero data
+                        do
+                        :: nempty(data_bus[1]) ->
+                            data_bus[1] ? _;
+                        :: empty(data_bus[1]) ->
+                            break;
+                        od;
+                        
+                        
+                        goto end
+                :: STATION_STATUS == IN_ELLIPTICAL_ORBIT -> skip
+                :: STATION_STATUS == IN_CIRLE_ORBIT -> STATION_STATUS = GO_TO_ELLIPTICAL_ORBIT
+                :: STATION_STATUS == IN_CIRLE_ORBIT || STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT -> skip
+            fi;
+
+            if
+                :: full(stop_reported) -> STATION_STATUS == IN_ELLIPTICAL_ORBIT
+                :: nfull(stop_reported) -> skip
+            fi
+
+            //if for in_circle orbit + going_to_elliptical
+            if //bius if
+                :: nempty(data_bus[1]) ->
+                    data_bus[1] ? var -> 
                     if 
                         :: var == BIUS_ZERO_MSG ->
                             cur_zero_msg_counter = cur_zero_msg_counter + 1
-                        :: var == ENGINE_MSG ->
-                            var = 0
-                        :: else -> skip
+                        :: else -> cur_zero_msg_counter = 0
                     fi
 
                     if 
                         ::  cur_zero_msg_counter >= ZERO_MEASEGES_TO_RESET ->
-                                BIUS_STATE = RESET
+                                command_bus[1] ! RESET
+                                resetSend = true
                                 cur_zero_msg_counter = 0
                         :: else -> skip
                     fi
 
-                    cur_angle_speed = cur_angle_speed + var;
                     if 
-                        :: cur_angle_speed == FINISH_COUNTER ->
-                            ENGINE_STATE = STOP_ENGINE
-                            BIUS_STATE = DISABLE_ACCELEROMETERS
-                            STATION_STATUS = LANDED
-                            cur_angle_speed = 0;
+                        :: !biusDisabledSend && !engineDisabledSend && var != BIUS_ZERO_MSG && var == FINISH_ANGLE_SPEED ->
+                            command_bus[0] ! STOP_ENGINE
+                            command_bus[1] ! DISABLE_ACCELEROMETERS
+                            biusDisabledSend = true
+                            engineDisabledSend = true
+                            STATION_STATUS = IN_ELLIPTICAL_ORBIT
+                            biusDisabledSend = true
+
+                            cur_zero_msg_counter = 0
                         :: else -> skip
                     fi
-                :: empty(data_bus) -> skip // poka tak
-                // :: cur_zero_msg_counter >= ZERO_MEASEGES_TO_RESET ->
-                //     BIUS_STATE = RESET
-                //     cur_zero_msg_counter = 0
+                :: empty(data_bus[1]) -> skip
+            fi
 
-                        // sync ! BKU
-                // :: BIUS_STATE == WORK && full(data_bus) -> 
-                //         BIUS_STATE = RESET;
-                //         // sync ! BKU
-                // :: BIUS_STATE == RESET && data_bus == BUS_SIZE -> skip
-                :: STATION_STATUS == LANDED -> 
-                    // sync ! BKU
-                    skip
-            fi;
+            if //engine if
+                :: nempty(data_bus[0]) ->
+                    data_bus[0] ? var -> 
+                :: empty(data_bus[0]) -> skip
+            fi
+
+            // if //modules
+            //     :: nempty(data_bus[2]) ->
+            //         data_bus[2] ? var -> 
+            //     :: empty(data_bus[2]) -> skip
+            // fi
+
+            end: skip
+
+            roundSync ! SYNC
     od;
 }
-
-// ЕСЛИ ТУТ НЕ ПОДОШЛО ХОТЬ ОДНО ОН БЛОЧИТСЯ И ОТДАЕМ УПРАВЛЕНИЕ, ПОТОМ ЕСЛИ ХОТЬ ОДНО УСЛОВИЕ TRUE, ПРОСЫПАЕТСЯ
 
 // БИУС-Л
 /* 
@@ -148,51 +177,66 @@ active proctype Bku() {
 */
 //id = 1
 active proctype Bius() {
+    int angleSpeed = 0;
+    mtype command = NONE
     do
     ::  turn ? BIUS ->
             if 
                 :: command_bus[1] ? ENABLE_ACCELEROMETERS ->
+                    acc: skip
+
+                    biusEnabledSend = false
                     BIUS_STATE = WORK
-                    data_bus ! BIUS_MSG
-                    // sync ! BIUS
+                    isBiusEnabled = true
+                    goto biusEnd
+                    
                 :: command_bus[1] ? DISABLE_ACCELEROMETERS ->
                     BIUS_STATE = NOT_WORK
-                        // sync ! BIUS
-                :: BIUS_STATE == NOT_WORK ->
-                    addSync ! SYNC // тут мб, что другой поставит синк, а этот зайдет, но вроде это безболезненно  - не. дичь написал
-                    if 
-                        :: len(data_bus) != BUS_SIZE -> data_bus ! BIUS_ZERO_MSG;
-                        :: len(data_bus) == BUS_SIZE -> skip
-                    fi
-                    addSync ? SYNC
-                        // data_bus ! BIUS_ZERO_MSG;
-                        // sync ! BIUS
-                :: BIUS_STATE == WORK /*&& data_bus != BUS_SIZE*/ ->
-                    addSync ! SYNC
-                    if 
-                        :: len(data_bus) != BUS_SIZE -> data_bus ! BIUS_MSG
-                        :: len(data_bus) == BUS_SIZE -> skip
-                    fi
-                    addSync ? SYNC
-                // :: BIUS_STATE == WORK && data_bus == BUS_SIZE -> skip // на счет этого пока не знаю
-                        // sync ! BIUS
-                // :: BIUS_STATE == WORK && full(data_bus) -> skip // на счет этого пока не знаю
-                // :: command_bus[1] ? RESET -> 
-                :: BIUS_STATE == RESET -> 
+                    stop_reported ! 1
+                    isBiusEnabled = false
+                    goto biusEnd
+
+                :: command_bus[1] ? RESET ->
+                    bool containsEnable = false
                     do
                         :: nempty(command_bus[1]) ->
-                            command_bus[1] ? _;
+                            command_bus[1] ? command;
+                            if
+                                :: command == ENABLE_ACCELEROMETERS -> containsEnable = true
+                                :: else -> skip
+                            fi
                         :: empty(command_bus[1]) ->
                             break;
                     od;
-
+                    isBiusEnabled = false
                     BIUS_STATE = NOT_WORK
 
-                    // sync ! BIUS
-                :: STATION_STATUS == LANDED -> 
-                    // sync ! BIUS
-                    skip
+                    if
+                        :: containsEnable -> goto acc
+                        :: else -> skip
+                    fi
+
+                    goto biusEnd
+                    
+                :: empty(command_bus[1]) -> skip
             fi
+
+            if
+                :: BIUS_STATE == NOT_WORK ->
+                            data_bus[1] ! BIUS_ZERO_MSG;
+                :: BIUS_STATE == WORK -> 
+                            data_bus[1] ! angleSpeed
+
+                            if
+                                :: angleSpeed + 1 <= FINISH_ANGLE_SPEED ->
+                                    angleSpeed++
+                                :: else -> skip
+                            fi
+                :: full(stop_reported) && STATION_STATUS == IN_ELLIPTICAL_ORBIT -> skip
+            fi
+
+            biusEnd: skip
+            roundSync ! SYNC
     od;
 }
 
@@ -210,54 +254,58 @@ active proctype Engine() {
             if
                 ::  command_bus[0] ? START_ENGINE ->
                     ENGINE_STATE = WORK
-                    data_bus ! ENGINE_MSG 
-                        // sync ! ENGINE
+                    goto engineEnd
+
                 :: command_bus[0] ? STOP_ENGINE ->
                     ENGINE_STATE = NOT_WORK
-                        // sync ! ENGINE
-                :: ENGINE_STATE == WORK /*&& data_bus != BUS_SIZE*/ ->
-                    addSync ! SYNC
-                    if 
-                        :: len(data_bus) != BUS_SIZE -> data_bus ! ENGINE_MSG
-                        :: len(data_bus) == BUS_SIZE -> skip
-                    fi
-                    addSync ? SYNC
-                :: ENGINE_STATE == NOT_WORK -> skip
-                        // data_bus ! ENGINE_MSG // тут таймаут, когда переполнено и больше не может класть
-                        // sync ! ENGINE
-                // :: ENGINE_STATE == WORK && data_bus == BUS_SIZE -> skip // на счет этого пока не знаю
-                // :: else -> skip
-                :: STATION_STATUS == LANDED -> 
-                    // sync ! ENGINE
-                    skip
+                    stop_reported ! 1
+                    goto engineEnd
+                :: empty(command_bus[0]) -> skip
             fi
+
+            if
+                :: ENGINE_STATE == WORK ->
+                    data_bus[0] ! ENGINE_MSG
+
+                :: ENGINE_STATE == NOT_WORK -> skip
+
+                :: full(stop_reported) && STATION_STATUS == IN_ELLIPTICAL_ORBIT -> skip
+            fi
+
+            engineEnd: skip
+            roundSync ! SYNC
     od
 }
 
-active proctype start() {
-    STATION_STATUS = START_LANDING
-}
+// id = 2
+// Всегда что-то отправляют, но они никак не влиют, по заданию нужны, пусть будут, хотя их лучше убрать, т.е только больше состояний делают
+// active proctype Modules() {
+//     do 
+//     :: turn ? MODULES ->
+//             if
+//                 :: MODULES_STATE == WORK ->
+//                     data_bus[2] ! MODULE_MSG
+//                 :: MODULES_STATE == NOT_WORK -> skip
+//             fi
+//             sync ! MODULES
+//     od
+// }
 
 
-// ltl {<> (STATION_STATUS == RESET)}
-// ltl {<> (len(data_bus) == BUS_SIZE)}
-// ltl {<> (cur_zero_msg_counter == ZERO_MEASEGES_TO_RESET)}
-// ltl {<>[] (STATION_STATUS == LANDED)}
-ltl {[] (STATION_STATUS == NON_LANDING)}
+// ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))}
+// ltl {[]((biusEnabledSend) -> <> (isBiusEnabled))}
+// ltl {<> (STATION_STATUS == IN_ELLIPTICAL_ORBIT)}
+// ltl {(STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT) -> <>(STATION_STATUS == IN_ELLIPTICAL_ORBIT) }
 
 
+//finals
+ltl {[]((biusEnabledSend) -> <> (BIUS_STATE == WORK))}
+ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))}
+// эти сверъху находят проблему, когда резет очищает ACCELEROMETRS_ENABLE
 
-// ltl {(BIUS_STATE == RESET && len(data_bus[1]) == BUS_SIZE) -> (BIUS_STATE == WORK)}
-// ltl {(BIUS_STATE == NOT_WORK && len(data_bus) == BUS_SIZE) -> ([]<> BIUS_STATE == WORK)}
+ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT && BIUS_STATE == WORK && ENGINE_STATE == WORK) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))} // ВСЕГДА если состоние, что начали идти на эллиптическую орбиту и двигатель с биусом запустились, то достигнем эллиптеческой орбиты
+
 
 // Столкновение происходит, когда передается слишком много "нулевых сигналов", БКУ дает команду "Перезагрузить", при перезагрузке
 // очищает массив входящих сигналов и пропускает команду "Включить акслерометры". (Т.е. он подавал много нулевых до того, как включить акселерометры было подано, в итоге команда включить попала в канал, но и так же была конмада резета, он сделал резет и пропустил команду включить акселеромтеры) -> фикс -  при сбросе бежать по массиву и выбирать по одной,
 // если встретилась включить акслелерометры, то включаем их и дальше очищаем 
-
-
-//КУ может передавать команды в шину команд, остальные модули только получать их. БИУС-Л, 
-//двигатель, другие модули могут передавать данные в шину передачи данных, БКУ только получает их.
-
-
-
-//55:36

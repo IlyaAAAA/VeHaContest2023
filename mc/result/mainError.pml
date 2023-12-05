@@ -28,12 +28,15 @@ chan stop_reported = [2] of { int }
 
 chan turn = [1] of { mtype };
 chan sync = [1] of {mtype}
+chan roundSync = [3] of {mtype}
 
 int cur_zero_msg_counter = 0;
 
 bool enableAccelerometersSended = false
 
 bool biusEnabledSend = false
+bool biusDisabledSend = false
+bool engineDisabledSend = false
 bool resetSend = false
 
 bool isBiusEnabled = false
@@ -42,16 +45,20 @@ bool isEngineEnabled = false
 active proctype Enviroment() {
     do
     ::  turn ! BKU
-        sync ? BKU
+        // sync ? BKU
 
         turn ! BIUS
-        sync ? BIUS
+        // sync ? BIUS
 
         turn ! ENGINE
-        sync ? ENGINE
+        // sync ? ENGINE
 
         // turn ! MODULES
         // sync ? MODULES
+
+        roundSync ? SYNC
+        roundSync ? SYNC
+        roundSync ? SYNC
     od
 }
 
@@ -81,12 +88,13 @@ active proctype Bku() {
     ::  turn ? BKU ->
             if 
                 ::  STATION_STATUS == GO_TO_ELLIPTICAL_ORBIT -> 
-                        command_bus[1] ! ENABLE_ACCELEROMETERS;
-                        command_bus[0] ! START_ENGINE;
                         biusEnabledSend = true
                         enableAccelerometersSended = true
                         STATION_STATUS = GOING_TO_ELLIPTICAL_ORBIT;
                         cur_zero_msg_counter = 0 // добавил, мб неправильно
+
+                        command_bus[1] ! ENABLE_ACCELEROMETERS;
+                        command_bus[0] ! START_ENGINE;
 
                         //clear from zero data
                         do
@@ -95,6 +103,7 @@ active proctype Bku() {
                         :: empty(data_bus[1]) ->
                             break;
                         od;
+                        
                         
                         goto end
                 :: STATION_STATUS == IN_ELLIPTICAL_ORBIT -> skip
@@ -126,10 +135,13 @@ active proctype Bku() {
                     fi
 
                     if 
-                        :: var != BIUS_ZERO_MSG && var == FINISH_ANGLE_SPEED ->
+                        :: !engineDisabledSend && ! biusDisabledSend && var != BIUS_ZERO_MSG && var == FINISH_ANGLE_SPEED ->
                             command_bus[0] ! STOP_ENGINE
                             command_bus[1] ! DISABLE_ACCELEROMETERS
                             STATION_STATUS = IN_ELLIPTICAL_ORBIT // mb менять, когда stop reported
+                            biusDisabledSend = true
+                            engineDisabledSend = true
+                            biusDisabledSend = true
 
                             cur_angle_speed = 0;
                             cur_zero_msg_counter = 0
@@ -151,7 +163,8 @@ active proctype Bku() {
             // fi
 
             end: skip
-            sync ! BKU
+
+            roundSync ! SYNC
     od;
 }
 
@@ -169,13 +182,11 @@ active proctype Bius() {
     int angleSpeed = 0;
     do
     ::  turn ? BIUS ->
-
-            // if для чтения
             if 
                 :: command_bus[1] ? ENABLE_ACCELEROMETERS ->
+                    biusEnabledSend = false
                     BIUS_STATE = WORK
                     isBiusEnabled = true
-                    biusEnabledSend = false
                     goto biusEnd
                     
                 :: command_bus[1] ? DISABLE_ACCELEROMETERS ->
@@ -194,21 +205,13 @@ active proctype Bius() {
                     isBiusEnabled = false
                     BIUS_STATE = NOT_WORK
                     goto biusEnd
-
                 :: empty(command_bus[1]) -> skip
-            // fi
+            fi
 
-
-            // if для записи 
+            if
                 :: BIUS_STATE == NOT_WORK ->
-                    if 
-                        :: nfull(data_bus[1]) ->
                             data_bus[1] ! BIUS_ZERO_MSG;
-                        :: full(data_bus[1]) -> skip
-                    fi
                 :: BIUS_STATE == WORK -> 
-                    if
-                        :: nfull(data_bus[1]) ->
                             data_bus[1] ! angleSpeed
 
                             if
@@ -216,13 +219,11 @@ active proctype Bius() {
                                     angleSpeed++
                                 :: else -> skip
                             fi
-                        :: full(data_bus[1]) -> skip
-                    fi
                 :: full(stop_reported) && STATION_STATUS == IN_ELLIPTICAL_ORBIT -> skip
             fi
 
             biusEnd: skip
-            sync ! BIUS
+            roundSync ! SYNC
     od;
 }
 
@@ -237,7 +238,6 @@ active proctype Bius() {
 active proctype Engine() {
     do 
     :: turn ? ENGINE ->
-            // if для чтения
             if
                 ::  command_bus[0] ? START_ENGINE ->
                     ENGINE_STATE = WORK
@@ -247,24 +247,20 @@ active proctype Engine() {
                     ENGINE_STATE = NOT_WORK
                     stop_reported ! 1
                     goto engineEnd
-
-                :: empty(command_bus[0]) -> skip
+                :: empty(command_bus[0]) -> skip  
             fi
 
-            // if для записи
             if
                 :: ENGINE_STATE == WORK ->
-                    if 
-                        :: nfull(data_bus[0]) ->
-                            data_bus[0] ! ENGINE_MSG
-                        :: full(data_bus[0]) -> skip
-                    fi
+                    data_bus[0] ! ENGINE_MSG
+
                 :: ENGINE_STATE == NOT_WORK -> skip
+
                 :: full(stop_reported) && STATION_STATUS == IN_ELLIPTICAL_ORBIT -> skip
             fi
 
             engineEnd: skip
-            sync ! ENGINE
+            roundSync ! SYNC
     od
 }
 
@@ -282,46 +278,14 @@ active proctype Engine() {
 //     od
 // }
 
-// active proctype start() {
-//     STATION_STATUS = GO_TO_ELLIPTICAL_ORBIT
-// }
+//finals
+ltl {[]((biusEnabledSend) -> <> (BIUS_STATE == WORK))}
+ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))}
+// эти сверъху находят проблему, когда резет очищает ACCELEROMETRS_ENABLE
 
+ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT && BIUS_STATE == WORK && ENGINE_STATE == WORK) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))} // ВСЕГДА если состоние, что начали идти на эллиптическую орбиту и двигатель с биусом запустились, то достигнем эллиптеческой орбиты
 
-// ltl {<> (STATION_STATUS == RESET)}
-// ltl {<> (len(data_bus) == BUS_SIZE)}
-// ltl {<> (cur_zero_msg_counter == ZERO_MEASEGES_TO_RESET)}
-// ltl {<>[] (STATION_STATUS == LANDED)}
-// ltl {[] (STATION_STATUS == NON_LANDING)}
-// ltl {[] ((BIUS_STATE == RESET) -> <>[] ((BIUS_STATE == WORK) U (STATION_STATUS != LANDED)))}
-// ltl {<> (STATION_STATUS == IN_ELLIPTICAL_ORBIT)}
-// ltl {(STATION_STATUS == GO_TO_ELLIPTICAL_ORBIT) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT)}
-
-
-// ltl {[] ((enableAccelerometersSended == true) -> <>((BIUS_STATE == WORK) U (STATION_STATUS == IN_ELLIPTICAL_ORBIT)))}
-
-
-// ltl {[] (resetSend && enableAccelerometersSended -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))}
-// ltl {[] (resetSend && enableAccelerometersSended -> <> (BIUS_STATE == WORK U (BIUS_STATE !=NOT_WORK && STATION_STATUS == IN_ELLIPTICAL_ORBIT)))} //dich mb
-// ltl {[] (resetSend && enableAccelerometersSended -> <> (BIUS_STATE == WORK U STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT))}
-// ltl {[](biusEnabledSend -> <> isBiusEnabled)}
-
-
-// ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))}
-ltl {[]((biusEnabledSend) -> <> (isBiusEnabled))}
-
-
-// ltl {(BIUS_STATE == RESET && len(data_bus[1]) == BUS_SIZE) -> (BIUS_STATE == WORK)}
-// ltl {(BIUS_STATE == NOT_WORK && len(data_bus) == BUS_SIZE) -> ([]<> BIUS_STATE == WORK)}
 
 // Столкновение происходит, когда передается слишком много "нулевых сигналов", БКУ дает команду "Перезагрузить", при перезагрузке
 // очищает массив входящих сигналов и пропускает команду "Включить акслерометры". (Т.е. он подавал много нулевых до того, как включить акселерометры было подано, в итоге команда включить попала в канал, но и так же была конмада резета, он сделал резет и пропустил команду включить акселеромтеры) -> фикс -  при сбросе бежать по массиву и выбирать по одной,
 // если встретилась включить акслелерометры, то включаем их и дальше очищаем 
-
-
-//КУ может передавать команды в шину команд, остальные модули только получать их. БИУС-Л, 
-//двигатель, другие модули могут передавать данные в шину передачи данных, БКУ только получает их.
-
-
-
-//55:36
-// с sync все равно такая же дичь, крч проблема в том, что если бку читает по одной, то в любом случае когда-то таймаут будет, если блочится на вставлении в канал, можно обходить проверку на полному и скипать, но правильно ли это, если сказано, что не должны теряться сообщения и дб приняты сообщения или посланы на каждом шаге
