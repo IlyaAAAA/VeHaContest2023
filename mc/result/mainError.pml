@@ -19,7 +19,7 @@ mtype = { SYNC }
 mtype STATION_STATUS = IN_CIRLE_ORBIT
 mtype BIUS_STATE = NOT_WORK
 mtype ENGINE_STATE = NOT_WORK
-mtype MODULES_STATE = NOT_WORK
+mtype MODULES_STATE = WORK
 
 // 0 - для двигателя, 1 - для биуса.
 chan command_bus[2] = [BUS_SIZE] of { mtype }; // ОТ БКУ К ДВИГАТЕЛЮ(0) И БИУСУ(1)
@@ -53,9 +53,10 @@ active proctype Enviroment() {
         turn ! ENGINE
         // sync ? ENGINE
 
-        // turn ! MODULES
+        turn ! MODULES
         // sync ? MODULES
 
+        roundSync ? SYNC
         roundSync ? SYNC
         roundSync ? SYNC
         roundSync ? SYNC
@@ -156,11 +157,11 @@ active proctype Bku() {
                 :: empty(data_bus[0]) -> skip
             fi
 
-            // if //modules
-            //     :: nempty(data_bus[2]) ->
-            //         data_bus[2] ? var -> 
-            //     :: empty(data_bus[2]) -> skip
-            // fi
+            if //modules
+                :: nempty(data_bus[2]) ->
+                    data_bus[2] ? _ -> 
+                :: empty(data_bus[2]) -> skip
+            fi
 
             end: skip
 
@@ -265,24 +266,23 @@ active proctype Engine() {
 }
 
 // id = 2
-// Всегда что-то отправляют, но они никак не влиют, по заданию нужны, пусть будут, хотя их лучше убрать, т.е только больше состояний делают
-// active proctype Modules() {
-//     do 
-//     :: turn ? MODULES ->
-//             if
-//                 :: MODULES_STATE == WORK ->
-//                     data_bus[2] ! MODULE_MSG
-//                 :: MODULES_STATE == NOT_WORK -> skip
-//             fi
-//             sync ! MODULES
-//     od
-// }
+// Их можно и убрать
+active proctype Modules() {
+    do 
+    :: turn ? MODULES ->
+            if
+                :: empty(data_bus[2]) ->
+                    data_bus[2] ! MODULE_MSG
+                :: nempty(data_bus[2]) ->skip
+            fi
+            // data_bus[2] ! MODULE_MSG
+            roundSync ! SYNC
+    od
+}
 
 //finals
 ltl {[]((biusEnabledSend) -> <> (BIUS_STATE == WORK))}
 ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))}
-// эти сверъху находят проблему, когда резет очищает ACCELEROMETRS_ENABLE
-
 ltl {[]((STATION_STATUS == GOING_TO_ELLIPTICAL_ORBIT && BIUS_STATE == WORK && ENGINE_STATE == WORK) -> <> (STATION_STATUS == IN_ELLIPTICAL_ORBIT))} // ВСЕГДА если состоние, что начали идти на эллиптическую орбиту и двигатель с биусом запустились, то достигнем эллиптеческой орбиты
 
 
